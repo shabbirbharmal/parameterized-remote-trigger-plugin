@@ -555,6 +555,8 @@ public class RemoteBuildConfiguration extends Builder {
             this.failBuild(new Exception("Got a blank response from Remote Jenkins Server [" + remoteServerURL + "], cannot continue."), listener);
         }
 
+        int nextBuildNumber = queryResponseObject.getInt("nextBuildNumber");
+
         if (this.getOverrideAuth()) {
             listener.getLogger().println(
                     "Using job-level defined credentials in place of those from remote Jenkins config ["
@@ -567,10 +569,11 @@ public class RemoteBuildConfiguration extends Builder {
         int queueID = -1;
 
         // Wait for remote triggered job not to be in queue before checking the actual build for 20 mins
-        // for (int timeout = 0; timeout < 20 * 60 * 1000; timeout += this.pollInterval * 1000) {
-        for (int attempts = 3; attempts > 0; attempts--) {
-            String queueUrlString = this.buildGetUrlForQueue();
+        // checkingQueue: for (int timeout = 0; timeout < 20 * 60 * 1000; timeout += this.pollInterval * 1000) {
+        checkingQueue: for (int attempts = 20; attempts > 0; attempts--) {
+            boolean foundInQueue = false;
 
+            String queueUrlString = this.buildGetUrlForQueue();
             JSONObject queueResponseObject = sendHTTPCall(queueUrlString, "GET", build, listener);
             if (queueResponseObject == null) {
                 listener.getLogger().println("Queue Query failed.");
@@ -578,25 +581,36 @@ public class RemoteBuildConfiguration extends Builder {
             }
 
             JSONArray queued_items = queueResponseObject.getJSONArray("items");
-            listener.getLogger().println("Number of Queued Builds: " + queued_items.size());
+            listener.getLogger().println("\nNumber of Queued Builds: " + queued_items.size());
 
+            if (queued_items.size() == 0) {
+                listener.getLogger().println("\nNothing in queue. It should be running already.\n");
+                break checkingQueue;
+            }
             foundInQueue: for (int i = 0; i < queued_items.size(); i++) {
                 JSONObject item = queued_items.getJSONObject(i);
                 listener.getLogger().println("Checking parameters of queued builds #" + i);
-                JSONObject action = item.getJSONObject("actions");
-                if (!action.has("parameters")) continue;
-                JSONArray parameters = action.getJSONArray("parameters");
-                // Check if the parameters match
-                if (compareParameters(listener, parameters, cleanedParams)) {
-                    // We now have a very high degree of confidence that this is the correct item in queue.
-                    // It is still possible that this is a false positive if there are no parameters,
-                    // or multiple jobs use the same parameters.
-                    queueID = item.getInt("id");
-                    listener.getLogger().println("Queue ID of the matching build: " + queueID);
-                    break foundInQueue;
+                JSONArray actions = item.getJSONArray("actions");
+                for (int j = 0; j < actions.size(); j++) {
+                    JSONObject action = actions.getJSONObject(j);
+                    if (!action.has("parameters")) continue;
+                    JSONArray parameters = action.getJSONArray("parameters");
+                    // Check if the parameters match
+                    if (compareParameters(listener, parameters, cleanedParams)) {
+                        // We now have a very high degree of confidence that this is the correct item in queue.
+                        // It is still possible that this is a false positive if there are no parameters,
+                        // or multiple jobs use the same parameters.
+                        queueID = item.getInt("id");
+                        listener.getLogger().println("Queue ID of the matching build: " + queueID + "\n");
+                        foundInQueue = true;
+                        break foundInQueue;
+                    }
                 }
-                // It's not in the queue; the job should have started building
-                break;
+            }
+
+            if (foundInQueue == false) {
+                listener.getLogger().println("\nCannot find a matching build in queue. It should be running already.\n");
+                break checkingQueue;
             }
             // Sleep for 'pollInterval' seconds.
             // Sleep takes miliseconds so need to convert this.pollInterval to milisecopnds (x 1000)
@@ -608,14 +622,9 @@ public class RemoteBuildConfiguration extends Builder {
         }
 
         // Remote Build should now be building (Not in queue anymore)
-
-        //listener.getLogger().println("Getting ID of next job to build. URL: " + queryUrlString);
-        queryResponseObject = sendHTTPCall(queryUrlString, "GET", build, listener);
-        if (queryResponseObject == null) {
-            //This should not happen as this page should return a JSON object
-            this.failBuild(new Exception("Got a blank response from Remote Jenkins Server [" + remoteServerURL + "], cannot continue."), listener);
-        }
-        int nextBuildNumber = queryResponseObject.getInt("nextBuildNumber");
+        // Get the next build number now after confirming the matching build is not in queue
+        // queryResponseObject = sendHTTPCall(queryUrlString, "GET", build, listener);
+        // int nextBuildNumber = queryResponseObject.getInt("nextBuildNumber");
 
         // Validate the build number via parameters
         foundIt: for (int buildNumber : new SearchPattern(nextBuildNumber, 10)) {
@@ -771,6 +780,8 @@ public class RemoteBuildConfiguration extends Builder {
             }
 
             String value = parameter.getString("value");
+
+            listener.getLogger().println("Build Parameters: " + name + " => " + value);
             // If we got the expected value, skip to the next parameter
             if (expected.equals(value)) continue;
 
